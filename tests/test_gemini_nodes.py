@@ -11,6 +11,15 @@ from PIL import Image
 from custom_nodes.ComfyUI_Gemini_Expanded_API import gemini_nodes
 
 
+def test_cache_seed_explicitly_enables_seed_widget_control():
+    inputs = gemini_nodes.SSL_GeminiAPIKeyConfig.INPUT_TYPES()
+    kind, options = inputs["optional"]["cache_seed"]
+    assert kind == "INT"
+    assert options["control_after_generate"] is True
+    assert options["min"] == 0
+    assert options["max"] == 2147483647
+
+
 def _execute_kwargs(config):
     return {
         "config": config,

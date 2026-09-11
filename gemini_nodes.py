@@ -117,7 +117,7 @@ class SSL_GeminiAPIKeyConfig(IO.ComfyNode):
                 IO.String.Input("google_application_credentials", default="", optional=True, multiline=False, tooltip="Optional absolute path to an application default credentials JSON file for Vertex AI."),
                 IO.Boolean.Input("use_cache", default=False, optional=True, tooltip="Reuse unchanged Gemini input context through the API cache after a local result-cache miss."),
                 IO.Int.Input("cache_ttl_minutes", default=60, min=1, step=1, optional=True, tooltip="How long Gemini keeps explicitly cached context."),
-                IO.Int.Input("cache_seed", default=0, min=0, max=2147483647, optional=True, tooltip="Gemini generation seed used when context caching is enabled."),
+                IO.Int.Input("cache_seed", default=0, min=0, max=2147483647, control_after_generate=True, optional=True, tooltip="Gemini generation seed used when context caching is enabled."),
             ],
             outputs=[
                 cls.GemConfig.Output("config")

@@ -1,5 +1,8 @@
 from comfy_api.latest import ComfyExtension, io
 from .gemini_nodes import GetKeyAPI, SSL_GeminiAPIKeyConfig, SSL_GeminiVideoConfig, SSL_GeminiTextPrompt
+from .response_schema import SSL_GeminiResponseSchema
+
+WEB_DIRECTORY = "./web"
 
 
 class GeminiExtension(ComfyExtension):
@@ -11,6 +14,7 @@ class GeminiExtension(ComfyExtension):
 			GetKeyAPI,
 			SSL_GeminiAPIKeyConfig,
 			SSL_GeminiVideoConfig,
+			SSL_GeminiResponseSchema,
 			SSL_GeminiTextPrompt,
 		]
 
@@ -19,4 +23,4 @@ async def comfy_entrypoint() -> GeminiExtension:
 	return GeminiExtension()
 
 
-__all__ = ['comfy_entrypoint']
+__all__ = ['comfy_entrypoint', 'WEB_DIRECTORY']

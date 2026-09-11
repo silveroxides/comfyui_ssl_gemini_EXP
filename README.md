@@ -84,6 +84,36 @@ If you are in China or other regions requiring a proxy:
 - `pad_at_start`: Prepend matching-resolution black video and silence for half one sampling interval before encoding.
 - `duration_aware_padding`: With start padding enabled, use the video's fractional-second duration rounded down to native video frames instead of the standard padding duration.
 
+### Response Schema Builder
+
+Add **Configure Gemini Response Schema** under `API/Gemini`. Choose the **Type** of the response. **Object** starts empty, with an **Add field** control.
+
+1. Use **Add field** to choose a type, such as **Text** or **Integer**. A new bordered entry appears inside its parent.
+2. Enter its **Name**, set **Required**, and add a **Description** if needed. Hover over a control for a plain-language explanation.
+3. Choose **Object** for a group of named fields or **Array** for a list of items. Children appear inside the parent's border with a small indentation.
+4. Choose **Disabled** to leave a field out while retaining its settings. Use **Remove** to delete the field and all its nested definitions completely.
+5. Queue the node to produce the `GEMINI_RESPONSE_SCHEMA` dictionary and formatted `schema_json` string. The JSON is also returned as a text preview.
+
+There is no fixed field count or container-depth cutoff in the builder. Only actual authored entries are stored. Generated property order follows field creation order. This does not remove runtime or provider schema-complexity limits.
+
+- **Text:** defaults to **Any text**. Choose **From list** under **Allowed values** to enter one allowed answer per line.
+- **Integer / Number:** **Minimum** and **Maximum** each offer **No limit / Set limit**.
+- **Boolean:** asks the AI for a yes-or-no answer. It does not set that answer in advance.
+- Names are trimmed and must be nonempty and unique among enabled siblings. Descriptions retain their text. Invalid active enums or numeric bounds identify the affected field.
+- An empty object emits empty properties; not every provider/model necessarily accepts that schema.
+
+Type changes retain inactive settings, including object children and array items. Save and reopen the workflow to restore the complete configuration. The JSON authoring state is stored internally; you do not edit it directly.
+
+The editor is one ComfyUI DOM widget with scoped styles. Entries use compact borders and padding. Each section has a **Collapse / Expand** button: it hides settings while leaving the header accessible and does not omit any information from the output. Collapsed sections are saved with the workflow. Descriptions use a single line; allowed-value lists remain multiline. Resize the node to adjust the editor area; long content scrolls inside it. Existing version-1 builder state remains compatible.
+
+After updating, restart ComfyUI, refresh the page, and recreate nodes from the previous fixed-slot prototype. Old prototype inputs are not silently migrated. Check nested field creation, disabling/re-enabling, type switching, queue output, and save/reopen behavior in your live frontend.
+
+This builder makes no API requests. Connect its **schema** output to **Response format** on **Expanded Gemini Text/Image**. That optional input appears after video and immediately before the growing image inputs. Leave it disconnected for a normal answer. The schema output can also connect directly to Core's **Preview as Text**; **schema_json** is the same schema already formatted as text.
+
+With a response format connected, the request uses JSON formatting and returns the final JSON in both **text** and **structured_output**. Input images and video can still be analyzed. Active image generation cannot be combined with a response format. Invalid JSON is reported as a processing error rather than repaired. Changing the format causes a new generation, while unchanged cached input context can be reused.
+
+For development tests, run `npm ci` once to install the test-only DOM library, then use `tests/run_tests.py --group response_schema` with the configured ComfyUI Python. The browser editor itself has no npm runtime dependency. DOM tests check structure and events; they do not replace checking actual canvas positioning, zoom, and layout in ComfyUI.
+
 ### Text Generation Node
 
 #### Required Parameters
@@ -100,6 +130,7 @@ If you are in China or other regions requiring a proxy:
 #### Optional Parameters
 
 - `video`: Optional `GEMINI_VIDEO_CONFIG` input. Its video is sent before images and prompt with embedded audio.
+- `response_schema` (**Response format**): Optional `GEMINI_RESPONSE_SCHEMA` input from the builder's **schema** output; placed immediately before Autogrow.
 - `image_inputs`: Optional ordered image autogrow inputs for image understanding.
 - `use_proxy`: Whether to use a proxy (True/False)
 - `proxy_host`: Proxy host address
@@ -108,8 +139,14 @@ If you are in China or other regions requiring a proxy:
 ## Output
 
 Text generation node output:
-- `text`: Generated text
-- `image`: If image generation is enabled, outputs the image.
+
+1. `text`: Final answer text, excluding returned thoughts.
+2. `image`: Generated image when image generation is enabled; otherwise the existing empty image output.
+3. `final_actual_seed`: The final generation seed.
+4. `structured_output`: Final JSON text when a connected response format succeeds; otherwise empty.
+5. `thoughts`: Returned thought text from the accepted response; otherwise empty. `include_thoughts` controls requesting it.
+
+The first three output positions remain unchanged. Errors and timeout fallbacks remain in `text`; `structured_output` and `thoughts` are empty on failure. Failed requests are not stored as successful cached results. JSON parsing checks syntax, not factual correctness or full schema compliance.
 
 ## Precautions/Notes
 - According to Google's "Generative AI Prohibited Use Policy", Gemini API has the following restrictions:

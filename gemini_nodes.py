@@ -175,9 +175,10 @@ class SSL_GeminiVideoConfig(IO.ComfyNode):
 
 class SSL_GeminiTextPrompt(IO.ComfyNode):
     GemConfig = IO.Custom("GEMINI_CONFIG")
+    ResponseSchema = IO.Custom("GEMINI_RESPONSE_SCHEMA")
     GeminiVideoConfig = IO.Custom("GEMINI_VIDEO_CONFIG")
     _cache: dict = {}
-    _seed_map_cache: dict = {}  # Maps (input_seed, fingerprint_without_seed) -> successful_gemini_seed
+    _seed_map_cache: dict = {}  # Maps (input_seed, fingerprint) -> successful_gemini_seed
     _client_cache: dict = {}  # Maps client_key tuple -> genai.Client instance
     _context_cache: dict = {}
     _context_cache_lock = threading.Lock()
@@ -255,6 +256,8 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                 IO.String.Input("timeout_fallback_text", default="", optional=True, multiline=True, tooltip="Text returned when the Gemini request times out. Leave empty to return the standard timeout message."),
                 IO.Combo.Input("image_size", options=["None", "512", "1K", "2K", "4K"], default="None", optional=True, tooltip="Generated image resolution. Gemini 3.1 Flash Lite Image supports only 1K; 512 is supported only by Gemini 3.1 Flash Image."),
                 cls.GeminiVideoConfig.Input("video", optional=True, tooltip="Optional configured Gemini video input with embedded audio and sampling FPS."),
+                cls.ResponseSchema.Input("response_schema", display_name="Response format", optional=True,
+                                         tooltip="Connect an answer format to request the fields you defined. Leave disconnected for a normal answer."),
                 IO.Autogrow.Input(
                     "image_inputs",
                     template=image_template,
@@ -269,7 +272,9 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
             outputs=[
                 IO.String.Output("text"),
                 IO.Image.Output("image"),
-                IO.Int.Output("final_actual_seed")
+                IO.Int.Output("final_actual_seed"),
+                IO.String.Output("structured_output", display_name="Structured output"),
+                IO.String.Output("thoughts", display_name="Thoughts"),
             ]
         )
 
@@ -453,7 +458,7 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                                              use_proxy=False, proxy_host="127.0.0.1", proxy_port=7890, timeout=30,
                                              include_thoughts=False, thinking_level=None, media_resolution=None,
                                              retry_pattern="", max_retries=3, use_cache=False,
-                                             cache_ttl_minutes=60, cache_seed=0, image_size="None"):
+                                             cache_ttl_minutes=60, cache_seed=0, image_size="None", schema_identity=None):
 
         # 1. Hashing Images
         def get_tensor_hash(tensor):
@@ -543,7 +548,8 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
             eff_thinking_level,   # EFFECTIVE thinking_level
             str(media_resolution),
             str(retry_pattern),   # Include retry pattern in fingerprint
-            int(max_retries)      # Include max retries in fingerprint
+            int(max_retries),     # Include max retries in fingerprint
+            schema_identity,
         )
 
         cached = cls._cache.get(fingerprint)
@@ -790,6 +796,10 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
             system_instruction=[types.Part.from_text(text=padded_system_instruction)],
         )
 
+    @staticmethod
+    def _reject_json_constant(value):
+        raise ValueError(f"Structured response contains invalid JSON constant: {value}.")
+
     @classmethod
     def execute(cls, config, prompt, system_instruction, model, temperature, top_p, top_k, max_output_tokens,
                 include_images, aspect_ratio, bypass_mode, thinking_budget,
@@ -798,12 +808,22 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                 retry_pattern="", max_retries=3, timeout_fallback_text="",
                 image_size="None",
                 video: GeminiVideoConfig.Type | None = None,
-                image_inputs: IO.Autogrow.Type | None = None) -> IO.NodeOutput:
+                image_inputs: IO.Autogrow.Type | None = None,
+                response_schema: ResponseSchema.Type | None = None) -> IO.NodeOutput:
 
         print(f"[INFO] SSL_GeminiTextPrompt execute called, model: {model}")
         use_cache = bool(config.get("use_cache", False))
         cache_ttl_minutes = int(config.get("cache_ttl_minutes", 60))
         cache_seed = int(config.get("cache_seed", 0))
+        schema_identity = None
+        schema_snapshot = None
+        if response_schema is not None:
+            if not isinstance(response_schema, dict):
+                raise ValueError("Response format must be a schema dictionary from the schema output.")
+            if include_images and model in cls.IMAGE_MODELS:
+                raise ValueError("Response format cannot be combined with image generation. Disable include_images.")
+            schema_identity = json.dumps(response_schema, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            schema_snapshot = json.loads(schema_identity)
         video_input = video.get("video") if video is not None else None
         video_fps = int(video.get("fps", 1)) if video is not None else None
         video_pad_at_start = bool(video.get("pad_at_start", False)) if video is not None else False
@@ -818,7 +838,7 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
         except Exception as e:
             print(f"[ERROR] Error processing input video: {e}")
             output_seed = cache_seed if use_cache and use_seed else seed if use_seed else 0
-            return IO.NodeOutput(f"Error processing input video: {e}", cls.generate_empty_image(), output_seed)
+            return IO.NodeOutput(f"Error processing input video: {e}", cls.generate_empty_image(), output_seed, "", "")
         video_hash = hashlib.sha256(video_bytes).hexdigest() if video_bytes is not None else None
         fingerprint, cached = cls._compute_fingerprint_and_check_cache(
             config, prompt, system_instruction, model, temperature, top_p, top_k, max_output_tokens,
@@ -829,12 +849,12 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
             include_thoughts, thinking_level, media_resolution,
             retry_pattern, max_retries, use_cache, cache_ttl_minutes, cache_seed,
             image_size=image_size,
+            schema_identity=schema_identity,
         )
 
         if cached is not None:
-            cached_text, cached_image, cached_seed = cached
             print(f"[INFO] Returning cached result for fingerprint {fingerprint}")
-            return IO.NodeOutput(cached_text, cached_image, cached_seed)
+            return IO.NodeOutput(*cached)
 
         print(f"[INFO] Starting generation, model: {model}, temperature: {temperature}")
 
@@ -853,18 +873,19 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
         input_seed = api_seed  # Store the original API seed for retry cache key
 
         # Check if we have a cached successful gemini seed for this input seed
-        # Build a cache key that excludes the seed itself (to match different gemini seeds for same input)
+        seed_cache_key = (input_seed, fingerprint)
         if use_seed and retry_pattern and max_retries > 0:
-            seed_cache_key = (input_seed, fingerprint[:-4])  # Exclude seed, retry_pattern, max_retries from key
             cached_gemini_seed = cls._seed_map_cache.get(seed_cache_key)
             if cached_gemini_seed is not None:
                 print(f"[INFO] Using cached successful gemini seed {cached_gemini_seed} for input seed {input_seed}")
                 actual_seed = cached_gemini_seed
 
         text_output = ""
+        thoughts_output = ""
+        structured_output = ""
+        is_success = False
         image_tensor = cls.generate_empty_image()
         proxy_url: str | None = None
-        timed_out = False
 
         try:
             if use_proxy:
@@ -927,15 +948,15 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
 
                     except KeyError as e:
                         print(f"Missing required environment variable: {e}")
-                        return IO.NodeOutput(f"Missing environment variable: {e}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0)
+                        return IO.NodeOutput(f"Missing environment variable: {e}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0, "", "")
 
                     except AssertionError as e:
                         print(f"Error: {e}")
-                        return IO.NodeOutput(f"Invalid environment variable: {e}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0)
+                        return IO.NodeOutput(f"Invalid environment variable: {e}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0, "", "")
 
                     except ValueError as e:
                         print(f"Error: {e}")
-                        return IO.NodeOutput(f"Invalid Enterprise/Vertex AI configuration: {e}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0)
+                        return IO.NodeOutput(f"Invalid Enterprise/Vertex AI configuration: {e}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0, "", "")
 
                 elif vertexai_express:
                     api_key = config.get("api_key")
@@ -944,6 +965,7 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                             "Invalid Enterprise express configuration: API key is required",
                             cls.generate_empty_image(),
                             actual_seed if actual_seed is not None else 0,
+                            "", "",
                         )
                     api_key_hash = hashlib.sha256(str(api_key).encode("utf-8")).hexdigest() if api_key else None
                     client_key = ("vertexai_express", api_key_hash, api_version, proxy_url)
@@ -986,7 +1008,7 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
 
             except Exception as e:
                 print(f"[ERROR] Gemini client initialization failed: {str(e)}")
-                return IO.NodeOutput(f"Gemini client initialization failed: {str(e)}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0)
+                return IO.NodeOutput(f"Gemini client initialization failed: {str(e)}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0, "", "")
 
             # Prepare contents (video + images + prompt)
             image_frames, image_batch_counts = cls._ordered_image_frames(image_inputs)
@@ -1045,7 +1067,7 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                     media_parts.extend(img_parts)
                 except Exception as e:
                     print(f"[ERROR] Error processing input image: {str(e)}")
-                    return IO.NodeOutput(f"Error processing input image: {str(e)}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0)
+                    return IO.NodeOutput(f"Error processing input image: {str(e)}", cls.generate_empty_image(), actual_seed if actual_seed is not None else 0, "", "")
             if media_parts:
                 contents = [
                     types.UserContent(
@@ -1097,6 +1119,10 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                 image_size=image_size,
                 allow_all_people=bool(config.get("use_vertexai_env", False) or config.get("vertexai_express", False)),
             )
+
+            if schema_snapshot is not None:
+                generate_content_config.response_mime_type = "application/json"
+                generate_content_config.response_json_schema = schema_snapshot
 
             if use_seed and actual_seed is not None:
                 try:
@@ -1183,6 +1209,7 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                     return
                 try:
                     current_text_output = ""
+                    current_thoughts_output = ""
                     current_image_tensor = None
                     parts = None
                     if api_response.candidates:
@@ -1190,7 +1217,10 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                     if parts:
                         for part in parts:
                             if hasattr(part, 'text') and part.text is not None:
-                                current_text_output += part.text
+                                if getattr(part, "thought", False):
+                                    current_thoughts_output += part.text
+                                else:
+                                    current_text_output += part.text
                             elif hasattr(part, 'inline_data') and part.inline_data is not None:
                                 try:
                                     inline_data = part.inline_data
@@ -1207,7 +1237,9 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                                         current_image_tensor = cls.generate_empty_image()
                     if current_image_tensor is None:
                         current_image_tensor = cls.generate_empty_image()
-                    result_queue.put(("success", (current_text_output, current_image_tensor)))
+                    if schema_snapshot is not None:
+                        json.loads(current_text_output, parse_constant=cls._reject_json_constant)
+                    result_queue.put(("success", (current_text_output, current_image_tensor, current_thoughts_output)))
                 except Exception as e_proc:
                     result_queue.put(("error", e_proc))
 
@@ -1220,12 +1252,17 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
             retry_needed = True
             while retry_needed:
                 retry_needed = False  # Will be set to True if pattern matches
+                is_success = False
+                structured_output = ""
+                thoughts_output = ""
 
                 try:
                     status, result = result_queue.get(timeout=timeout)
                     elapsed_time = time.time() - start_time
                     if status == "success":
-                        text_output, image_tensor = result
+                        text_output, image_tensor, thoughts_output = result
+                        structured_output = text_output if schema_snapshot is not None else ""
+                        is_success = True
 
                         # Check if retry pattern matches
                         if retry_pattern and max_retries > 0 and retry_attempt < max_retries:
@@ -1297,10 +1334,10 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
                                 print(f"[WARNING] Invalid retry regex pattern: {regex_err}")
 
                 except queue.Empty:
-                    timed_out = True
                     text_output = timeout_fallback_text or f"Gemini API request/processing timed out, waited {timeout} seconds."
 
         except Exception as e:
+            is_success = False
             print(f"[ERROR] Unhandled error in generate method: {str(e)}")
             text_output = f"Unhandled error: {str(e)}"
             if image_tensor is None:
@@ -1308,22 +1345,23 @@ class SSL_GeminiTextPrompt(IO.ComfyNode):
 
         final_actual_seed = actual_seed if actual_seed is not None else 0
 
-        is_success = not timed_out and not text_output.startswith("API call/processing error:") and not text_output.startswith("Gemini API request/processing timed out")
+        if not is_success:
+            structured_output = ""
+            thoughts_output = ""
 
         # Cache the result
         if use_seed and is_success:
             try:
-                cls._cache[fingerprint] = (text_output, image_tensor, final_actual_seed)
+                cls._cache[fingerprint] = (text_output, image_tensor, final_actual_seed, structured_output, thoughts_output)
             except Exception:
                 pass
 
             # Cache the successful gemini seed for this input seed (if retry was enabled)
             if retry_pattern and max_retries > 0:
-                seed_cache_key = (input_seed, fingerprint[:-4])
                 cls._seed_map_cache[seed_cache_key] = final_actual_seed
                 print(f"[INFO] Cached successful gemini seed {final_actual_seed} for input seed {input_seed}")
 
 
-        return IO.NodeOutput(text_output, image_tensor, final_actual_seed)
+        return IO.NodeOutput(text_output, image_tensor, final_actual_seed, structured_output, thoughts_output)
 
 # V3 uses ComfyExtension entrypoint in __init__.py to expose nodes

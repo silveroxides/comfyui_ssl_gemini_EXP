@@ -1,4 +1,5 @@
 import hashlib
+import json
 import threading
 from io import BytesIO
 from types import SimpleNamespace
@@ -9,6 +10,233 @@ import torch
 from PIL import Image
 
 from custom_nodes.ComfyUI_Gemini_Expanded_API import gemini_nodes
+from custom_nodes.ComfyUI_Gemini_Expanded_API.response_schema import SSL_GeminiResponseSchema, default_state, default_entry
+
+
+@pytest.fixture
+def structured_client(monkeypatch):
+    node = gemini_nodes.SSL_GeminiTextPrompt
+    for cache in (node._cache, node._client_cache, node._context_cache, node._seed_map_cache):
+        cache.clear()
+    captured = SimpleNamespace(calls=[], creations=[], clients=[], responses=[], cache_error=None, on_client=None)
+
+    class Models:
+        def generate_content(self, **kwargs):
+            captured.calls.append({**kwargs, "config": kwargs["config"].model_copy(deep=True)})
+            response = captured.responses.pop(0) if captured.responses else [('final', '{"answer":"ok"}')]
+            if callable(response):
+                response = response()
+            if isinstance(response, Exception):
+                raise response
+            parts = [SimpleNamespace(text=text, thought=kind == "thought", inline_data=None) for kind, text in response]
+            return SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=parts))])
+
+    class Caches:
+        def create(self, **kwargs):
+            captured.creations.append(kwargs)
+            if captured.cache_error:
+                raise captured.cache_error
+            return SimpleNamespace(name=f"cachedContents/{len(captured.creations)}")
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured.clients.append(kwargs)
+            if captured.on_client:
+                captured.on_client()
+            self.models, self.caches = Models(), Caches()
+
+    monkeypatch.setattr(gemini_nodes.genai, "Client", Client)
+    yield captured
+    for cache in (node._cache, node._client_cache, node._context_cache, node._seed_map_cache):
+        cache.clear()
+
+
+@pytest.mark.parametrize("model, settings", [
+    ("gemini-2.5-flash", {}), ("gemini-3.1-pro-preview", {"thinking_level": "high"}),
+    (gemini_nodes.SSL_GeminiTextPrompt.GEMINI_3_7_FLASH, {"thinking_level": "medium"}),
+])
+@pytest.mark.parametrize("client_config", [{}, {"vertexai_express": True}, {"use_vertexai_env": True, "vertexai_project": "test", "vertexai_location": "global"}])
+def test_builder_schema_reaches_generate_content(structured_client, monkeypatch, model, settings, client_config):
+    target = gemini_nodes.SSL_GeminiTextPrompt.define_schema().inputs[-2]
+    assert target.get_io_type() == SSL_GeminiResponseSchema.define_schema().outputs[0].get_io_type() == "GEMINI_RESPONSE_SCHEMA"
+    monkeypatch.setenv("GOOGLE_GENAI_USE_ENTERPRISE", "true")
+    state = default_state()
+    state["entries"]["n1"] = default_entry("string")
+    state["entries"]["n1"]["name"] = "answer"
+    state["entries"]["n0"]["fields"] = ["n1"]
+    state["next_id"] = 2
+    schema = SSL_GeminiResponseSchema.execute(json.dumps(state))[0]
+    args = _execute_kwargs(_config(api_key="test", **client_config))
+    args.update(model=model, response_schema=schema, include_thoughts=True, **settings)
+    structured_client.responses = [[("thought", "thinking"), ("final", '{"answer":'), ("final", ' "ok"}')]]
+    output = gemini_nodes.SSL_GeminiTextPrompt.execute(**args)
+    assert output[0] == output[3] == '{"answer": "ok"}'
+    assert output[4] == "thinking"
+    sent = structured_client.calls[0]["config"]
+    assert sent.response_mime_type == "application/json"
+    assert sent.response_json_schema == schema
+    assert sent.response_schema is None
+
+
+@pytest.mark.parametrize("schema", [None, {}])
+def test_absent_schema_is_distinct_from_empty_schema(structured_client, schema):
+    structured_client.responses = [[("thought", "separate"), ("final", "{}")]]
+    output = gemini_nodes.SSL_GeminiTextPrompt.execute(**_execute_kwargs(_config()), response_schema=schema)
+    assert output[0] == "{}"
+    assert output[3] == ("" if schema is None else "{}")
+    assert output[4] == "separate"
+    assert structured_client.calls[0]["config"].response_mime_type == (None if schema is None else "application/json")
+
+
+@pytest.mark.parametrize("text", [' {"x": 1}\n', '[1, 2]', '"hello"', '1', '1.2', 'true', 'null'])
+def test_structured_json_keeps_original_text(structured_client, text):
+    structured_client.responses = [[("final", text)]]
+    output = gemini_nodes.SSL_GeminiTextPrompt.execute(**_execute_kwargs(_config()), response_schema={})
+    assert output[0] == output[3] == text
+
+
+@pytest.mark.parametrize("text", ["", "{", '```json\n{}\n```', "NaN", "Infinity", "-Infinity", '{"x":NaN}'])
+def test_invalid_structured_answer_is_not_cached(structured_client, text):
+    structured_client.responses = [[("thought", "must not leak"), ("final", text)]]
+    output = gemini_nodes.SSL_GeminiTextPrompt.execute(**_execute_kwargs(_config()), response_schema={}, use_seed=True, seed=4)
+    assert output[0].startswith("API call/processing error:")
+    assert output[3] == output[4] == ""
+    assert not gemini_nodes.SSL_GeminiTextPrompt._cache
+
+
+def test_schema_snapshot_and_result_cache(structured_client):
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    structured_client.on_client = lambda: schema["properties"].update(extra={"type": "number"})
+    structured_client.responses = [[("thought", "saved thought"), ("final", '{"answer":"ok"}')]]
+    args = _execute_kwargs(_config())
+    args.update(use_seed=True, seed=7, response_schema=schema)
+    first = gemini_nodes.SSL_GeminiTextPrompt.execute(**args)
+    sent = structured_client.calls[0]["config"].response_json_schema
+    assert "extra" not in sent["properties"]
+    args["response_schema"] = sent
+    second = gemini_nodes.SSL_GeminiTextPrompt.execute(**args)
+    assert len(structured_client.calls) == 1
+    assert second[3] == first[3] and second[4] == "saved thought"
+    assert len(next(iter(gemini_nodes.SSL_GeminiTextPrompt._cache.values()))) == 5
+    args["response_schema"] = schema
+    gemini_nodes.SSL_GeminiTextPrompt.execute(**args)
+    assert len(structured_client.calls) == 2
+    args["response_schema"] = None
+    assert gemini_nodes.SSL_GeminiTextPrompt.execute(**args)[3] == ""
+    assert len(structured_client.calls) == 3
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_schema_changes_reuse_context_and_survive_cache_fallback(structured_client, failure):
+    if failure:
+        structured_client.cache_error = RuntimeError("cache unavailable")
+    args = _execute_kwargs(_config(use_cache=True))
+    for schema in ({"type": "object"}, {"type": "object", "description": "changed"}):
+        gemini_nodes.SSL_GeminiTextPrompt.execute(**args, response_schema=schema)
+        assert structured_client.calls[-1]["config"].response_json_schema == schema
+        assert structured_client.calls[-1]["config"].response_mime_type == "application/json"
+    assert len(structured_client.creations) == (2 if failure else 1)
+    if not failure:
+        assert structured_client.calls[0]["config"].cached_content == structured_client.calls[1]["config"].cached_content
+
+
+def test_expired_context_recreation_keeps_schema(structured_client):
+    structured_client.responses = [RuntimeError("cached content expired"), [("final", "{}")]]
+    output = gemini_nodes.SSL_GeminiTextPrompt.execute(**_execute_kwargs(_config(use_cache=True)), response_schema={})
+    assert output[3] == "{}"
+    assert len(structured_client.creations) == 2
+    assert all(call["config"].response_json_schema == {} for call in structured_client.calls)
+
+
+def test_regex_retry_uses_only_final_text_and_keeps_latest_thoughts(structured_client):
+    structured_client.responses = [
+        [("thought", "old"), ("final", '{"answer":"retry"}')],
+        [("thought", "retry in thought only"), ("final", '{"answer":"done"}')],
+    ]
+    args = _execute_kwargs(_config())
+    args.update(response_schema={}, use_seed=True, seed=5, retry_pattern="retry", max_retries=2)
+    output = gemini_nodes.SSL_GeminiTextPrompt.execute(**args)
+    assert len(structured_client.calls) == 2
+    assert output[3] == '{"answer":"done"}'
+    assert output[4] == "retry in thought only"
+    assert all(call["config"].response_json_schema == {} for call in structured_client.calls)
+    key = next(iter(gemini_nodes.SSL_GeminiTextPrompt._seed_map_cache))
+    assert key[1][-1] == "{}"
+    assert len(key[1]) == len(next(iter(gemini_nodes.SSL_GeminiTextPrompt._cache)))
+
+
+def test_failed_retry_and_outer_exception_are_not_cached(structured_client, monkeypatch):
+    node = gemini_nodes.SSL_GeminiTextPrompt
+    structured_client.responses = [[("thought", "old"), ("final", '"retry"')], RuntimeError("failed")]
+    args = _execute_kwargs(_config())
+    args.update(response_schema={}, use_seed=True, seed=5, retry_pattern="retry", max_retries=1)
+    output = node.execute(**args)
+    assert output[3] == output[4] == ""
+    assert not node._cache and not node._seed_map_cache
+    def broken(**_kwargs):
+        raise RuntimeError("config failed")
+    monkeypatch.setattr(node, "_build_generate_content_config", broken)
+    output = node.execute(**args)
+    assert output[0].startswith("Unhandled error:")
+    assert output[3] == output[4] == ""
+    assert not node._cache
+
+
+@pytest.mark.parametrize("schema", [[], {"bad": float("nan")}, {"bad": object()}])
+def test_bad_schema_fails_before_client_creation(structured_client, schema):
+    with pytest.raises((ValueError, TypeError)):
+        gemini_nodes.SSL_GeminiTextPrompt.execute(**_execute_kwargs(_config()), response_schema=schema)
+    assert not structured_client.clients
+
+
+def test_schema_rejects_effective_image_generation_only(structured_client):
+    args = _execute_kwargs(_config())
+    args.update(include_images=True, response_schema={}, model="gemini-3-pro-image")
+    with pytest.raises(ValueError, match="image generation"):
+        gemini_nodes.SSL_GeminiTextPrompt.execute(**args)
+    assert not structured_client.clients
+    args.update(model="gemini-2.5-flash", image_inputs={"image_1": torch.zeros(1, 8, 8, 3)})
+    assert gemini_nodes.SSL_GeminiTextPrompt.execute(**args)[3] == '{"answer":"ok"}'
+
+
+def test_schema_order_and_request_settings_isolate_retry_seed_keys(structured_client):
+    node = gemini_nodes.SSL_GeminiTextPrompt
+    args = _execute_kwargs(_config())
+    args.update(model="gemini-3.1-pro-preview", use_seed=True, seed=7, retry_pattern="never", max_retries=1,
+                response_schema={"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}, thinking_level="low")
+    node.execute(**args)
+    for change in [
+        {"response_schema": {"type": "object", "properties": {"b": {"type": "string"}, "a": {"type": "string"}}}},
+        {"thinking_level": "high"}, {"media_resolution": "high"}, {"max_retries": 2}, {"retry_pattern": "different"},
+    ]:
+        node.execute(**{**args, **change})
+    assert len(node._seed_map_cache) == len(node._cache) == len(structured_client.calls) == 6
+
+
+def test_success_then_retry_timeout_discards_outputs(structured_client):
+    release = threading.Event()
+    completed = threading.Event()
+    def block():
+        try:
+            release.wait(timeout=1)
+            raise RuntimeError("released")
+        finally:
+            completed.set()
+    structured_client.responses = [[("thought", "first"), ("final", '"retry"')], block]
+    args = _execute_kwargs(_config())
+    args.update(response_schema={}, use_seed=True, seed=4, retry_pattern="retry", max_retries=1, timeout=0.01,
+                timeout_fallback_text="fallback")
+    try:
+        output = gemini_nodes.SSL_GeminiTextPrompt.execute(**args)
+    finally:
+        release.set()
+        completed.wait(timeout=1)
+    assert output[0] == "fallback"
+    assert output[3] == output[4] == ""
+    assert not gemini_nodes.SSL_GeminiTextPrompt._cache
+    assert not gemini_nodes.SSL_GeminiTextPrompt._seed_map_cache
+
+
 
 
 def test_cache_seed_explicitly_enables_seed_widget_control():
@@ -85,9 +313,12 @@ def _video_config(data, fps=1):
 def test_image_autogrow_is_last_input():
     schema = gemini_nodes.SSL_GeminiTextPrompt.define_schema()
 
-    assert schema.inputs[-2].id == "video"
+    assert schema.inputs[-3].id == "video"
+    assert schema.inputs[-2].id == "response_schema"
     assert schema.inputs[-2].optional is True
     assert schema.inputs[-1].id == "image_inputs"
+    assert "response_schema" in gemini_nodes.SSL_GeminiTextPrompt.INPUT_TYPES()["optional"]
+    assert [output.id for output in schema.outputs] == ["text", "image", "final_actual_seed", "structured_output", "thoughts"]
 
 
 def test_video_config_exposes_native_video_and_integer_fps():
@@ -1190,4 +1421,5 @@ def test_timeout_returns_custom_fallback_without_caching(monkeypatch):
         release_request.set()
 
     assert output[0] == "configured fallback"
+    assert output[3] == output[4] == ""
     assert gemini_nodes.SSL_GeminiTextPrompt._cache == {}

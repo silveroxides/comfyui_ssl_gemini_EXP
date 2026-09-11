@@ -1,0 +1,8 @@
+{
+  "name": "comfyui-gemini-expanded-api-tests",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  }
+}
